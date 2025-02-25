@@ -35,38 +35,49 @@ def reset_session_state():
     st.session_state.current_file = None
     st.session_state.uploaded_file_changed = True
 
-def detect_geometry_columns(df, sample_size=10):
-    """Enhanced geometry column detection with regex patterns"""
+def detect_geometry_columns(df):
+    """Detect potential geometry columns in the DataFrame."""
     geometry_candidates = []
-    wkt_pattern = re.compile(r'^(POINT|LINESTRING|POLYGON|MULTIPOINT|MULTILINESTRING|MULTIPOLYGON)\s*\(', re.IGNORECASE)
-    geojson_pattern = re.compile(r'^\s*{\s*"type"\s*:\s*"Feature"\s*,', re.IGNORECASE)
 
     # Check for common geometry column names
-    common_names = ['geometry', 'geom', 'shape', 'the_geom', 'wkt', 'geojson']
-    geometry_candidates = [col for col in df.columns if col.lower() in common_names]
-
-    # Check column content patterns
     for col in df.columns:
-        if col in geometry_candidates:
-            continue
-            
-        sample = df[col].dropna().head(sample_size)
-        if len(sample) == 0:
-            continue
-
-        # Check for WKT patterns
-        wkt_match = sample.apply(lambda x: bool(wkt_pattern.match(str(x)) if pd.notnull(x) else False)
-        if wkt_match.any():
+        if col.lower() in ['geometry', 'geom', 'shape', 'the_geom', 'wkt', 'geojson', 'polygon', 'polygon_corrected', 'polygon_original']:
             geometry_candidates.append(col)
-            continue
 
-        # Check for GeoJSON patterns
-        geojson_match = sample.apply(lambda x: bool(geojson_pattern.match(str(x)) if pd.notnull(x) else False)
-        if geojson_match.any():
-            geometry_candidates.append(col)
-            continue
+    # Check for columns that might contain GeoJSON or WKT strings
+    for col in df.columns:
+        if col not in geometry_candidates:
+            # Sample a few non-null values
+            sample = df[col].dropna().head(5)
 
-    return list(set(geometry_candidates))  # Remove duplicates
+            # Check if might be WKT
+            if sample.dtype == object and len(sample) > 0:
+                try:
+                    # Try to parse first element as WKT
+                    first_val = sample.iloc[0]
+                    if isinstance(first_val, str) and (
+                        first_val.startswith('POINT') or
+                        first_val.startswith('POLYGON') or
+                        first_val.startswith('MULTIPOLYGON') or
+                        first_val.startswith('LINESTRING') or
+                        first_val.startswith('MULTILINESTRING')
+                    ):
+                        wkt.loads(first_val)  # Try parsing
+                        geometry_candidates.append(col)
+                        continue
+                except Exception:
+                    pass
+
+                # Check if might be GeoJSON
+                try:
+                    first_val = sample.iloc[0]
+                    if isinstance(first_val, str) and '{' in first_val and '}' in first_val:
+                        geojson = json.loads(first_val)
+                        if 'type' in geojson and 'coordinates' in geojson:
+                            geometry_candidates.append(col)
+                            continue
+                except Exception:
+                    pass
 
 def validate_crs(crs_input):
     """Validate CRS input using pyproj"""
@@ -78,59 +89,54 @@ def validate_crs(crs_input):
         return None
 
 def convert_csv_to_geodataframe(df, mode, **kwargs):
-    """Robust CSV to GeoDataFrame conversion with validation"""
-    try:
-        crs = validate_crs(kwargs.get('crs', "EPSG:4326"))
-        if not crs:
-            return None
+    """Convert a pandas DataFrame to a GeoDataFrame."""
+    crs = kwargs.get('crs', "EPSG:4326")
 
-        if mode == 'points':
-            lon_col = kwargs.get('lon_col')
-            lat_col = kwargs.get('lat_col')
-            
-            # Validate coordinate columns
-            for col in [lon_col, lat_col]:
-                if col not in df.columns:
-                    st.error(f"Column '{col}' not found in DataFrame")
-                    return None
+    if mode == 'points':
+        lon_col = kwargs.get('lon_col')
+        lat_col = kwargs.get('lat_col')
 
-            # Convert coordinates to numeric
-            df[lon_col] = pd.to_numeric(df[lon_col], errors='coerce')
-            df[lat_col] = pd.to_numeric(df[lat_col], errors='coerce')
-            
-            valid_coords = df[lon_col].notna() & df[lat_col].notna()
-            if not valid_coords.all():
-                st.warning(f"Removed {(~valid_coords).sum()} rows with invalid coordinates")
-                df = df[valid_coords].copy()
+        valid_coords = df[lon_col].notna() & df[lat_col].notna()
+        if not valid_coords.all():
+            st.warning(f"Found {(~valid_coords).sum()} rows with missing coordinates. These will be excluded.")
+            df = df[valid_coords].copy()
 
-            geometry = [Point(xy) for xy in zip(df[lon_col], df[lat_col])]
-            return gpd.GeoDataFrame(df, geometry=geometry, crs=crs)
+        geometry = [Point(xy) for xy in zip(df[lon_col], df[lat_col])]
+        gdf = gpd.GeoDataFrame(df, geometry=geometry, crs=crs)
 
-        elif mode in ['wkt', 'geojson']:
-            geom_col = kwargs.get('geom_col')
-            if geom_col not in df.columns:
-                st.error(f"Geometry column '{geom_col}' not found")
-                return None
+    elif mode == 'wkt':
+        geom_col = kwargs.get('geom_col')
 
-            valid_geoms = df[geom_col].notna()
-            if not valid_geoms.all():
-                st.warning(f"Removed {(~valid_geoms).sum()} rows with missing geometries")
-                df = df[valid_geoms].copy()
+        valid_geoms = df[geom_col].notna()
+        if not valid_geoms.all():
+            st.warning(f"Found {(~valid_geoms).sum()} rows with missing geometries. These will be excluded.")
+            df = df[valid_geoms].copy()
 
-            try:
-                if mode == 'wkt':
-                    geometry = df[geom_col].apply(wkt.loads)
-                else:
-                    geometry = df[geom_col].apply(lambda x: shape(json.loads(x)))
-                
-                return gpd.GeoDataFrame(df.drop(columns=[geom_col]), geometry=geometry, crs=crs)
-            except Exception as e:
-                st.error(f"Error parsing {mode.upper()} geometries: {str(e)}")
-                return None
+        try:
+            geometry = df[geom_col].apply(wkt.loads)
+            df_copy = df.drop(columns=[geom_col])
+            gdf = gpd.GeoDataFrame(df_copy, geometry=geometry, crs=crs)
+        except Exception as e:
+            st.error(f"Error parsing WKT geometries: {str(e)}")
+            raise
 
-    except Exception as e:
-        st.error(f"Conversion error: {str(e)}")
-        return None
+    elif mode == 'geojson':
+        geom_col = kwargs.get('geom_col')
+
+        valid_geoms = df[geom_col].notna()
+        if not valid_geoms.all():
+            st.warning(f"Found {(~valid_geoms).sum()} rows with missing geometries. These will be excluded.")
+            df = df[valid_geoms].copy()
+
+        try:
+            geometry = df[geom_col].apply(lambda x: shape(json.loads(x)))
+            df_copy = df.drop(columns=[geom_col])
+            gdf = gpd.GeoDataFrame(df_copy, geometry=geometry, crs=crs)
+        except Exception as e:
+            st.error(f"Error parsing GeoJSON geometries: {str(e)}")
+            raise
+
+    return gdf
 
 # UI Components
 st.title("Geospatial Data Format Converter")
@@ -143,7 +149,7 @@ uploaded_file = st.file_uploader("Upload your file",
 
 if uploaded_file:
     # Check file size
-    if uploaded_file.size > 100 * 1024 * 1024:  # 100MB
+    if uploaded_file.size > 250 * 1024 * 1024:  # 100MB
         st.warning("⚠️ Large file detected! Processing might take longer and use significant memory.")
 
     # Handle new file upload
