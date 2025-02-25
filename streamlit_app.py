@@ -18,7 +18,7 @@ def detect_geometry_columns(df):
     
     # Check for common geometry column names
     for col in df.columns:
-        if col.lower() in ['geometry', 'geom', 'shape', 'the_geom', 'wkt', 'geojson']:
+        if col.lower() in ['geometry', 'geom', 'shape', 'the_geom', 'wkt', 'geojson', 'polygon', 'polygon_corrected', 'polygon_original']:
             geometry_candidates.append(col)
     
     # Check for columns that might contain GeoJSON or WKT strings
@@ -214,10 +214,18 @@ if uploaded_file is not None:
                     index=0  # Default to UTF-8
                 )
                 
-                csv_options["header"] = 0 if st.checkbox("File has header", value=True) else None
+                has_header = st.checkbox("File has header", value=True)
                 
-                if not csv_options["header"]:
-                    csv_options["prefix"] = st.text_input("Column prefix", "col")
+                if not has_header:
+                    prefix = st.text_input("Column prefix", "col")
+                    # Only set header=None and names with prefix when no header
+                    csv_options["header"] = None
+                    # Generate column names with prefix
+                    preview_df = pd.read_csv(uploaded_file, sep=selected_sep, nrows=1)
+                    num_cols = len(preview_df.columns)
+                    csv_options["names"] = [f"{prefix}{i}" for i in range(num_cols)]
+                else:
+                    csv_options["header"] = 0
             
             # Try to read the CSV with selected separator
             try:
