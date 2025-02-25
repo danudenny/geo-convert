@@ -181,81 +181,125 @@ if uploaded_file is not None:
     try:
         # Process the file based on its type
         if file_extension == "csv":
-            df = pd.read_csv(uploaded_file)
-            st.write("CSV file preview:")
-            st.dataframe(df.head())
+            # CSV separator selector
+            separator_options = {
+                ",": "Comma (,)",
+                ";": "Semicolon (;)",
+                "\t": "Tab (\\t)",
+                "|": "Pipe (|)",
+                " ": "Space ( )"
+            }
             
-            # Detect potential geometry columns
-            geometry_candidates = detect_geometry_columns(df)
-            
-            # Get column names for coordinates
-            columns = df.columns.tolist()
-            
-            # Try to detect coordinate columns automatically
-            lon_col_guess = next((col for col in columns if col.lower() in ["lon", "longitude", "long", "x"]), columns[0])
-            lat_col_guess = next((col for col in columns if col.lower() in ["lat", "latitude", "y"]), columns[1] if len(columns) > 1 else columns[0])
-            
-            # Choose geometry creation method
-            geometry_mode = st.radio(
-                "How to create geometries?",
-                options=["Points from coordinates", "WKT geometry column", "GeoJSON geometry column"],
-                index=0 if not geometry_candidates else 1
+            selected_sep = st.selectbox(
+                "Select CSV separator",
+                options=list(separator_options.keys()),
+                format_func=lambda x: separator_options[x],
+                index=0,  # Default to comma
+                key="separator_selector"
             )
             
-            if geometry_mode == "Points from coordinates":
-                col1, col2 = st.columns(2)
-                with col1:
-                    lon_col = st.selectbox("Longitude column", options=columns, index=columns.index(lon_col_guess))
-                with col2:
-                    lat_col = st.selectbox("Latitude column", options=columns, index=columns.index(lat_col_guess))
-                    
-                crs = st.text_input("Coordinate Reference System", "EPSG:4326")
+            # Additional CSV reading options
+            csv_options = {}
+            
+            with st.expander("Advanced CSV Options"):
+                csv_options["decimal"] = st.selectbox(
+                    "Decimal separator",
+                    options=[".", ","],
+                    index=0  # Default to period
+                )
                 
-                if st.button("Create GeoDataFrame from Points"):
-                    # Create GeoDataFrame using point coordinates
-                    gdf = convert_csv_to_geodataframe(df, 'points', lon_col=lon_col, lat_col=lat_col, crs=crs)
-                    st.session_state.gdf = gdf
-                    st.write("GeoDataFrame created successfully!")
-                    st.write("Preview:")
-                    st.dataframe(gdf.head())
-                    st.write("Geometry Information:")
-                    st.markdown(extract_geometry_info(gdf))
-                    st.session_state.show_output_options = True
-                    
-            elif geometry_mode == "WKT geometry column":
-                geom_col_options = geometry_candidates if geometry_candidates else columns
-                geom_col = st.selectbox("WKT geometry column", options=geom_col_options, 
-                                       index=0 if geom_col_options else 0)
-                crs = st.text_input("Coordinate Reference System", "EPSG:4326")
+                csv_options["encoding"] = st.selectbox(
+                    "File encoding",
+                    options=["utf-8", "latin1", "iso-8859-1", "cp1252"],
+                    index=0  # Default to UTF-8
+                )
                 
-                if st.button("Create GeoDataFrame from WKT"):
-                    # Create GeoDataFrame using WKT geometry
-                    gdf = convert_csv_to_geodataframe(df, 'wkt', geom_col=geom_col, crs=crs)
-                    st.session_state.gdf = gdf
-                    st.write("GeoDataFrame created successfully!")
-                    st.write("Preview:")
-                    st.dataframe(gdf.head())
-                    st.write("Geometry Information:")
-                    st.markdown(extract_geometry_info(gdf))
-                    st.session_state.show_output_options = True
-                    
-            elif geometry_mode == "GeoJSON geometry column":
-                geom_col_options = geometry_candidates if geometry_candidates else columns
-                geom_col = st.selectbox("GeoJSON geometry column", options=geom_col_options,
-                                       index=0 if geom_col_options else 0)
-                crs = st.text_input("Coordinate Reference System", "EPSG:4326")
+                csv_options["header"] = 0 if st.checkbox("File has header", value=True) else None
                 
-                if st.button("Create GeoDataFrame from GeoJSON"):
-                    # Create GeoDataFrame using GeoJSON geometry
-                    gdf = convert_csv_to_geodataframe(df, 'geojson', geom_col=geom_col, crs=crs)
-                    st.session_state.gdf = gdf
-                    st.write("GeoDataFrame created successfully!")
-                    st.write("Preview:")
-                    st.dataframe(gdf.head())
-                    st.write("Geometry Information:")
-                    st.markdown(extract_geometry_info(gdf))
-                    st.session_state.show_output_options = True
-        
+                if not csv_options["header"]:
+                    csv_options["prefix"] = st.text_input("Column prefix", "col")
+            
+            # Try to read the CSV with selected separator
+            try:
+                df = pd.read_csv(uploaded_file, sep=selected_sep, **csv_options)
+                st.write("CSV file preview:")
+                st.dataframe(df.head())
+                
+                # Detect potential geometry columns
+                geometry_candidates = detect_geometry_columns(df)
+                
+                # Get column names for coordinates
+                columns = df.columns.tolist()
+                
+                # Try to detect coordinate columns automatically
+                lon_col_guess = next((col for col in columns if col.lower() in ["lon", "longitude", "long", "x"]), columns[0])
+                lat_col_guess = next((col for col in columns if col.lower() in ["lat", "latitude", "y"]), columns[1] if len(columns) > 1 else columns[0])
+                
+                # Choose geometry creation method
+                geometry_mode = st.radio(
+                    "How to create geometries?",
+                    options=["Points from coordinates", "WKT geometry column", "GeoJSON geometry column"],
+                    index=0 if not geometry_candidates else 1
+                )
+                
+                if geometry_mode == "Points from coordinates":
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        lon_col = st.selectbox("Longitude column", options=columns, index=columns.index(lon_col_guess))
+                    with col2:
+                        lat_col = st.selectbox("Latitude column", options=columns, index=columns.index(lat_col_guess))
+                        
+                    crs = st.text_input("Coordinate Reference System", "EPSG:4326")
+                    
+                    if st.button("Create GeoDataFrame from Points"):
+                        # Create GeoDataFrame using point coordinates
+                        gdf = convert_csv_to_geodataframe(df, 'points', lon_col=lon_col, lat_col=lat_col, crs=crs)
+                        st.session_state.gdf = gdf
+                        st.write("GeoDataFrame created successfully!")
+                        st.write("Preview:")
+                        st.dataframe(gdf.head())
+                        st.write("Geometry Information:")
+                        st.markdown(extract_geometry_info(gdf))
+                        st.session_state.show_output_options = True
+                        
+                elif geometry_mode == "WKT geometry column":
+                    geom_col_options = geometry_candidates if geometry_candidates else columns
+                    geom_col = st.selectbox("WKT geometry column", options=geom_col_options, 
+                                        index=0 if geom_col_options else 0)
+                    crs = st.text_input("Coordinate Reference System", "EPSG:4326")
+                    
+                    if st.button("Create GeoDataFrame from WKT"):
+                        # Create GeoDataFrame using WKT geometry
+                        gdf = convert_csv_to_geodataframe(df, 'wkt', geom_col=geom_col, crs=crs)
+                        st.session_state.gdf = gdf
+                        st.write("GeoDataFrame created successfully!")
+                        st.write("Preview:")
+                        st.dataframe(gdf.head())
+                        st.write("Geometry Information:")
+                        st.markdown(extract_geometry_info(gdf))
+                        st.session_state.show_output_options = True
+                        
+                elif geometry_mode == "GeoJSON geometry column":
+                    geom_col_options = geometry_candidates if geometry_candidates else columns
+                    geom_col = st.selectbox("GeoJSON geometry column", options=geom_col_options,
+                                        index=0 if geom_col_options else 0)
+                    crs = st.text_input("Coordinate Reference System", "EPSG:4326")
+                    
+                    if st.button("Create GeoDataFrame from GeoJSON"):
+                        # Create GeoDataFrame using GeoJSON geometry
+                        gdf = convert_csv_to_geodataframe(df, 'geojson', geom_col=geom_col, crs=crs)
+                        st.session_state.gdf = gdf
+                        st.write("GeoDataFrame created successfully!")
+                        st.write("Preview:")
+                        st.dataframe(gdf.head())
+                        st.write("Geometry Information:")
+                        st.markdown(extract_geometry_info(gdf))
+                        st.session_state.show_output_options = True
+                        
+            except pd.errors.ParserError as e:
+                st.error(f"Error parsing CSV with selected separator '{selected_sep}': {str(e)}")
+                st.info("Try a different separator or check if the file is properly formatted.")
+            
         elif file_extension in ["geojson", "parquet", "gpkg"]:
             # Determine the appropriate method to read the file
             if file_extension == "geojson":
@@ -383,10 +427,13 @@ with st.expander("How to use this app"):
        - Shapefile (zipped)
        - GeoPackage
     
-    2. **For CSV files**, choose one of the following methods:
-       - **Points from coordinates**: Select longitude and latitude columns
-       - **WKT geometry column**: Select a column containing WKT geometry strings (e.g., 'POLYGON((...))')
-       - **GeoJSON geometry column**: Select a column containing GeoJSON geometry objects
+    2. **For CSV files**:
+       - Select the appropriate separator (comma, semicolon, tab, etc.)
+       - Configure advanced options if needed (decimal separator, encoding, etc.)
+       - Choose one of the following methods:
+         - **Points from coordinates**: Select longitude and latitude columns
+         - **WKT geometry column**: Select a column containing WKT geometry strings (e.g., 'POLYGON((...))')
+         - **GeoJSON geometry column**: Select a column containing GeoJSON geometry objects
        - Specify the coordinate reference system (default: EPSG:4326, which is WGS84)
        - Click the appropriate button to create your GeoDataFrame
     
@@ -399,6 +446,7 @@ with st.expander("How to use this app"):
     - The app supports various geometry types: points, linestrings, polygons, and their multi-variants
     - Shapefiles are provided as ZIP files containing all necessary components
     - For large files, processing may take a few moments
+    - Different regions may use different CSV formats; use the separator and decimal options accordingly
     """)
 
 # Footer
