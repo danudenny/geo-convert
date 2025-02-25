@@ -1,7 +1,9 @@
 import streamlit as st
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import Point
+import json
+from shapely.geometry import Point, Polygon, LineString, shape
+from shapely import wkt
 import tempfile
 import os
 import io
@@ -10,20 +12,114 @@ from pathlib import Path
 
 st.set_page_config(page_title="Geospatial Format Converter", layout="wide")
 
-def convert_csv_to_geodataframe(df, lon_col, lat_col, crs="EPSG:4326"):
-    """Convert a pandas DataFrame with coordinate columns to a GeoDataFrame."""
-    geometry = [Point(xy) for xy in zip(df[lon_col], df[lat_col])]
-    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs=crs)
-    return gdf
+def detect_geometry_columns(df):
+    """Detect potential geometry columns in the DataFrame."""
+    geometry_candidates = []
+    
+    # Check for common geometry column names
+    for col in df.columns:
+        if col.lower() in ['geometry', 'geom', 'shape', 'the_geom', 'wkt', 'geojson']:
+            geometry_candidates.append(col)
+    
+    # Check for columns that might contain GeoJSON or WKT strings
+    for col in df.columns:
+        if col not in geometry_candidates:
+            # Sample a few non-null values
+            sample = df[col].dropna().head(5)
+            
+            # Check if might be WKT
+            if sample.dtype == object and len(sample) > 0:
+                try:
+                    # Try to parse first element as WKT
+                    first_val = sample.iloc[0]
+                    if isinstance(first_val, str) and (
+                        first_val.startswith('POINT') or 
+                        first_val.startswith('POLYGON') or 
+                        first_val.startswith('MULTIPOLYGON') or
+                        first_val.startswith('LINESTRING') or
+                        first_val.startswith('MULTILINESTRING')
+                    ):
+                        wkt.loads(first_val)  # Try parsing
+                        geometry_candidates.append(col)
+                        continue
+                except Exception:
+                    pass
+                
+                # Check if might be GeoJSON
+                try:
+                    first_val = sample.iloc[0]
+                    if isinstance(first_val, str) and '{' in first_val and '}' in first_val:
+                        geojson = json.loads(first_val)
+                        if 'type' in geojson and 'coordinates' in geojson:
+                            geometry_candidates.append(col)
+                            continue
+                except Exception:
+                    pass
+    
+    return geometry_candidates
 
-def get_download_button(data, file_ext, mime_type):
-    """Create a download button for the specified file."""
-    return st.download_button(
-        label=f"Download {file_ext}",
-        data=data,
-        file_name=f"converted_data.{file_ext}",
-        mime=mime_type
-    )
+def convert_csv_to_geodataframe(df, mode, **kwargs):
+    """
+    Convert a pandas DataFrame to a GeoDataFrame based on the specified mode.
+    
+    Modes:
+    - 'points': Create Point geometries from longitude and latitude columns
+    - 'wkt': Parse geometries from a WKT column
+    - 'geojson': Parse geometries from a GeoJSON column
+    """
+    crs = kwargs.get('crs', "EPSG:4326")
+    
+    if mode == 'points':
+        lon_col = kwargs.get('lon_col')
+        lat_col = kwargs.get('lat_col')
+        
+        # Filter out rows with invalid coordinates
+        valid_coords = df[lon_col].notna() & df[lat_col].notna()
+        if not valid_coords.all():
+            st.warning(f"Found {(~valid_coords).sum()} rows with missing coordinates. These will be excluded.")
+            df = df[valid_coords].copy()
+        
+        # Create geometry column
+        geometry = [Point(xy) for xy in zip(df[lon_col], df[lat_col])]
+        gdf = gpd.GeoDataFrame(df, geometry=geometry, crs=crs)
+        
+    elif mode == 'wkt':
+        geom_col = kwargs.get('geom_col')
+        
+        # Filter out rows with missing geometry
+        valid_geoms = df[geom_col].notna()
+        if not valid_geoms.all():
+            st.warning(f"Found {(~valid_geoms).sum()} rows with missing geometries. These will be excluded.")
+            df = df[valid_geoms].copy()
+        
+        # Convert WKT strings to Shapely geometries
+        try:
+            geometry = df[geom_col].apply(wkt.loads)
+            df_copy = df.drop(columns=[geom_col])
+            gdf = gpd.GeoDataFrame(df_copy, geometry=geometry, crs=crs)
+        except Exception as e:
+            st.error(f"Error parsing WKT geometries: {str(e)}")
+            raise
+            
+    elif mode == 'geojson':
+        geom_col = kwargs.get('geom_col')
+        
+        # Filter out rows with missing geometry
+        valid_geoms = df[geom_col].notna()
+        if not valid_geoms.all():
+            st.warning(f"Found {(~valid_geoms).sum()} rows with missing geometries. These will be excluded.")
+            df = df[valid_geoms].copy()
+        
+        # Convert GeoJSON strings to Shapely geometries
+        try:
+            geometry = df[geom_col].apply(lambda x: shape(json.loads(x)))
+            df_copy = df.drop(columns=[geom_col])
+            gdf = gpd.GeoDataFrame(df_copy, geometry=geometry, crs=crs)
+        except Exception as e:
+            st.error(f"Error parsing GeoJSON geometries: {str(e)}")
+            raise
+            
+    return gdf
 
 def save_file_to_zip(gdf, file_format, filename="converted_data"):
     """Save a GeoDataFrame to a specified format and compress it into a ZIP file."""
@@ -51,11 +147,32 @@ def save_file_to_zip(gdf, file_format, filename="converted_data"):
             with open(gpkg_path, "rb") as f:
                 return f.read()
 
+def extract_geometry_info(gdf):
+    """Extract information about the geometries in the GeoDataFrame."""
+    if gdf is None or len(gdf) == 0:
+        return "No geometries found"
+        
+    geometry_types = gdf.geometry.type.value_counts().to_dict()
+    crs = gdf.crs
+    bounds = gdf.total_bounds
+    
+    info = f"**Geometry Types**: {', '.join([f'{k} ({v})' for k, v in geometry_types.items()])}\n"
+    info += f"**CRS**: {crs}\n"
+    info += f"**Bounds** (minx, miny, maxx, maxy): {bounds[0]:.4f}, {bounds[1]:.4f}, {bounds[2]:.4f}, {bounds[3]:.4f}"
+    
+    return info
+
 st.title("Geospatial Data Format Converter")
 st.write("Convert between CSV, GeoJSON, Parquet, Shapefile, and GeoPackage formats")
 
+# Initialize session state variables if they don't exist
+if 'gdf' not in st.session_state:
+    st.session_state.gdf = None
+if 'show_output_options' not in st.session_state:
+    st.session_state.show_output_options = False
+
 # File uploader
-uploaded_file = st.file_uploader("Upload your file", type=["csv", "geojson", "parquet"])
+uploaded_file = st.file_uploader("Upload your file", type=["csv", "geojson", "parquet", "gpkg", "zip"], key="file_uploader")
 
 if uploaded_file is not None:
     # Determine file type from extension
@@ -68,138 +185,210 @@ if uploaded_file is not None:
             st.write("CSV file preview:")
             st.dataframe(df.head())
             
-            # Column selection for coordinates
-            col1, col2 = st.columns(2)
+            # Detect potential geometry columns
+            geometry_candidates = detect_geometry_columns(df)
             
-            # Get column names
+            # Get column names for coordinates
             columns = df.columns.tolist()
             
             # Try to detect coordinate columns automatically
             lon_col_guess = next((col for col in columns if col.lower() in ["lon", "longitude", "long", "x"]), columns[0])
             lat_col_guess = next((col for col in columns if col.lower() in ["lat", "latitude", "y"]), columns[1] if len(columns) > 1 else columns[0])
             
-            with col1:
-                lon_col = st.selectbox("Longitude column", options=columns, index=columns.index(lon_col_guess))
+            # Choose geometry creation method
+            geometry_mode = st.radio(
+                "How to create geometries?",
+                options=["Points from coordinates", "WKT geometry column", "GeoJSON geometry column"],
+                index=0 if not geometry_candidates else 1
+            )
             
-            with col2:
-                lat_col = st.selectbox("Latitude column", options=columns, index=columns.index(lat_col_guess))
+            if geometry_mode == "Points from coordinates":
+                col1, col2 = st.columns(2)
+                with col1:
+                    lon_col = st.selectbox("Longitude column", options=columns, index=columns.index(lon_col_guess))
+                with col2:
+                    lat_col = st.selectbox("Latitude column", options=columns, index=columns.index(lat_col_guess))
+                    
+                crs = st.text_input("Coordinate Reference System", "EPSG:4326")
                 
-            crs = st.text_input("Coordinate Reference System", "EPSG:4326")
-            
-            # Convert to GeoDataFrame
-            if st.button("Create GeoDataFrame"):
-                gdf = convert_csv_to_geodataframe(df, lon_col, lat_col, crs)
-                st.write("GeoDataFrame created successfully!")
-                st.write("Preview:")
-                st.dataframe(gdf.head())
+                if st.button("Create GeoDataFrame from Points"):
+                    # Create GeoDataFrame using point coordinates
+                    gdf = convert_csv_to_geodataframe(df, 'points', lon_col=lon_col, lat_col=lat_col, crs=crs)
+                    st.session_state.gdf = gdf
+                    st.write("GeoDataFrame created successfully!")
+                    st.write("Preview:")
+                    st.dataframe(gdf.head())
+                    st.write("Geometry Information:")
+                    st.markdown(extract_geometry_info(gdf))
+                    st.session_state.show_output_options = True
+                    
+            elif geometry_mode == "WKT geometry column":
+                geom_col_options = geometry_candidates if geometry_candidates else columns
+                geom_col = st.selectbox("WKT geometry column", options=geom_col_options, 
+                                       index=0 if geom_col_options else 0)
+                crs = st.text_input("Coordinate Reference System", "EPSG:4326")
                 
-                # Output format selection
-                output_format = st.selectbox(
-                    "Select output format",
-                    options=["geojson", "parquet", "shp", "gpkg"],
-                    format_func=lambda x: {
-                        "geojson": "GeoJSON",
-                        "parquet": "GeoParquet",
-                        "shp": "Shapefile (zipped)",
-                        "gpkg": "GeoPackage"
-                    }[x]
-                )
+                if st.button("Create GeoDataFrame from WKT"):
+                    # Create GeoDataFrame using WKT geometry
+                    gdf = convert_csv_to_geodataframe(df, 'wkt', geom_col=geom_col, crs=crs)
+                    st.session_state.gdf = gdf
+                    st.write("GeoDataFrame created successfully!")
+                    st.write("Preview:")
+                    st.dataframe(gdf.head())
+                    st.write("Geometry Information:")
+                    st.markdown(extract_geometry_info(gdf))
+                    st.session_state.show_output_options = True
+                    
+            elif geometry_mode == "GeoJSON geometry column":
+                geom_col_options = geometry_candidates if geometry_candidates else columns
+                geom_col = st.selectbox("GeoJSON geometry column", options=geom_col_options,
+                                       index=0 if geom_col_options else 0)
+                crs = st.text_input("Coordinate Reference System", "EPSG:4326")
                 
-                # Export data in the selected format
-                if output_format == "geojson":
-                    geojson_data = gdf.to_json()
-                    get_download_button(geojson_data, "geojson", "application/json")
-                
-                elif output_format == "parquet":
-                    parquet_buffer = io.BytesIO()
-                    gdf.to_parquet(parquet_buffer)
-                    parquet_buffer.seek(0)
-                    get_download_button(parquet_buffer, "parquet", "application/octet-stream")
-                
-                elif output_format == "shp":
-                    shapefile_zip = save_file_to_zip(gdf, "shp")
-                    get_download_button(shapefile_zip, "zip", "application/zip")
-                
-                elif output_format == "gpkg":
-                    geopackage_data = save_file_to_zip(gdf, "gpkg")
-                    get_download_button(geopackage_data, "gpkg", "application/geopackage+sqlite3")
+                if st.button("Create GeoDataFrame from GeoJSON"):
+                    # Create GeoDataFrame using GeoJSON geometry
+                    gdf = convert_csv_to_geodataframe(df, 'geojson', geom_col=geom_col, crs=crs)
+                    st.session_state.gdf = gdf
+                    st.write("GeoDataFrame created successfully!")
+                    st.write("Preview:")
+                    st.dataframe(gdf.head())
+                    st.write("Geometry Information:")
+                    st.markdown(extract_geometry_info(gdf))
+                    st.session_state.show_output_options = True
         
-        elif file_extension == "geojson":
-            # Read GeoJSON file
-            gdf = gpd.read_file(uploaded_file)
-            st.write("GeoJSON data preview:")
+        elif file_extension in ["geojson", "parquet", "gpkg"]:
+            # Determine the appropriate method to read the file
+            if file_extension == "geojson":
+                gdf = gpd.read_file(uploaded_file)
+            elif file_extension == "parquet":
+                gdf = gpd.read_parquet(uploaded_file)
+            elif file_extension == "gpkg":
+                gdf = gpd.read_file(uploaded_file, driver="GPKG")
+                
+            st.session_state.gdf = gdf
+            st.write(f"{file_extension.upper()} data preview:")
             st.dataframe(gdf.head())
+            st.write("Geometry Information:")
+            st.markdown(extract_geometry_info(gdf))
+            st.session_state.show_output_options = True
+            
+        elif file_extension == "zip":
+            # Check if it's likely a zipped shapefile
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with zipfile.ZipFile(uploaded_file, 'r') as zip_ref:
+                        zip_ref.extractall(tmpdir)
+                    
+                    # Look for .shp file
+                    shp_files = list(Path(tmpdir).glob("*.shp"))
+                    if not shp_files:
+                        st.error("No .shp file found in the ZIP archive.")
+                    else:
+                        gdf = gpd.read_file(shp_files[0])
+                        st.session_state.gdf = gdf
+                        st.write("Shapefile data preview:")
+                        st.dataframe(gdf.head())
+                        st.write("Geometry Information:")
+                        st.markdown(extract_geometry_info(gdf))
+                        st.session_state.show_output_options = True
+            except Exception as e:
+                st.error(f"Error processing ZIP file: {str(e)}")
+        
+        # Show output options if we have a GeoDataFrame
+        if st.session_state.show_output_options and st.session_state.gdf is not None:
+            st.subheader("Convert to:")
+            
+            # All possible output formats
+            all_formats = ["geojson", "parquet", "shp", "gpkg"]
+            
+            # Remove the input format from options
+            if file_extension in ["geojson", "parquet", "shp", "gpkg"]:
+                format_options = [fmt for fmt in all_formats if fmt != file_extension]
+            else:
+                format_options = all_formats
             
             # Output format selection
             output_format = st.selectbox(
                 "Select output format",
-                options=["parquet", "shp", "gpkg"],
+                options=format_options,
                 format_func=lambda x: {
+                    "geojson": "GeoJSON",
                     "parquet": "GeoParquet",
                     "shp": "Shapefile (zipped)",
                     "gpkg": "GeoPackage"
-                }[x]
+                }[x],
+                key="output_format_selector"  # Unique key for the widget
             )
             
-            # Export data in the selected format
-            if output_format == "parquet":
+            # Get the GeoDataFrame from session state
+            gdf = st.session_state.gdf
+            
+            # Generate download data based on selected format
+            if output_format == "geojson":
+                geojson_data = gdf.to_json()
+                st.download_button(
+                    label="Download GeoJSON",
+                    data=geojson_data,
+                    file_name="converted_data.geojson",
+                    mime="application/json",
+                    key="download_button_geojson"  # Unique key for this download button
+                )
+            
+            elif output_format == "parquet":
                 parquet_buffer = io.BytesIO()
                 gdf.to_parquet(parquet_buffer)
                 parquet_buffer.seek(0)
-                get_download_button(parquet_buffer, "parquet", "application/octet-stream")
+                st.download_button(
+                    label="Download GeoParquet",
+                    data=parquet_buffer,
+                    file_name="converted_data.parquet",
+                    mime="application/octet-stream",
+                    key="download_button_parquet"  # Unique key for this download button
+                )
             
             elif output_format == "shp":
                 shapefile_zip = save_file_to_zip(gdf, "shp")
-                get_download_button(shapefile_zip, "zip", "application/zip")
+                st.download_button(
+                    label="Download Shapefile (ZIP)",
+                    data=shapefile_zip,
+                    file_name="converted_data_shapefile.zip",
+                    mime="application/zip",
+                    key="download_button_shp"  # Unique key for this download button
+                )
             
             elif output_format == "gpkg":
                 geopackage_data = save_file_to_zip(gdf, "gpkg")
-                get_download_button(geopackage_data, "gpkg", "application/geopackage+sqlite3")
-        
-        elif file_extension == "parquet":
-            # Read Parquet file
-            gdf = gpd.read_parquet(uploaded_file)
-            st.write("Parquet data preview:")
-            st.dataframe(gdf.head())
-            
-            # Output format selection
-            output_format = st.selectbox(
-                "Select output format",
-                options=["geojson", "shp", "gpkg"],
-                format_func=lambda x: {
-                    "geojson": "GeoJSON",
-                    "shp": "Shapefile (zipped)",
-                    "gpkg": "GeoPackage"
-                }[x]
-            )
-            
-            # Export data in the selected format
-            if output_format == "geojson":
-                geojson_data = gdf.to_json()
-                get_download_button(geojson_data, "geojson", "application/json")
-            
-            elif output_format == "shp":
-                shapefile_zip = save_file_to_zip(gdf, "shp")
-                get_download_button(shapefile_zip, "zip", "application/zip")
-            
-            elif output_format == "gpkg":
-                geopackage_data = save_file_to_zip(gdf, "gpkg")
-                get_download_button(geopackage_data, "gpkg", "application/geopackage+sqlite3")
+                st.download_button(
+                    label="Download GeoPackage",
+                    data=geopackage_data,
+                    file_name="converted_data.gpkg",
+                    mime="application/geopackage+sqlite3",
+                    key="download_button_gpkg"  # Unique key for this download button
+                )
                 
     except Exception as e:
         st.error(f"Error processing file: {str(e)}")
+        import traceback
+        st.error(traceback.format_exc())
 
 # Instructions
 with st.expander("How to use this app"):
     st.markdown("""
     ### Instructions
 
-    1. **Upload a file**: Choose a CSV, GeoJSON, or Parquet file.
+    1. **Upload a file**: 
+       - CSV file with coordinate or geometry columns
+       - GeoJSON file
+       - GeoParquet file
+       - Shapefile (zipped)
+       - GeoPackage
     
-    2. **For CSV files**:
-       - Select the columns containing longitude and latitude coordinates
+    2. **For CSV files**, choose one of the following methods:
+       - **Points from coordinates**: Select longitude and latitude columns
+       - **WKT geometry column**: Select a column containing WKT geometry strings (e.g., 'POLYGON((...))')
+       - **GeoJSON geometry column**: Select a column containing GeoJSON geometry objects
        - Specify the coordinate reference system (default: EPSG:4326, which is WGS84)
-       - Click "Create GeoDataFrame" to process the data
+       - Click the appropriate button to create your GeoDataFrame
     
     3. **Choose output format**: Select your desired output format
     
@@ -207,8 +396,8 @@ with st.expander("How to use this app"):
     
     ### Notes:
     
+    - The app supports various geometry types: points, linestrings, polygons, and their multi-variants
     - Shapefiles are provided as ZIP files containing all necessary components
-    - Make sure your CSV includes valid coordinate columns
     - For large files, processing may take a few moments
     """)
 
